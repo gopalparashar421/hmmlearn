@@ -744,8 +744,6 @@ class BaseHSMM(BaseEstimator):
             # Rows that sum to zero get uniform distribution (excluding self)
             zero_rows = (row_sums.squeeze() == 0)
             if zero_rows.any():
-                uniform_row = np.ones(self.n_components) / max(self.n_components - 1, 1)
-                np.fill_diagonal(np.diag(uniform_row).__class__, 0)  # noqa – done below
                 for i in np.where(zero_rows)[0]:
                     self.transmat_[i] = 1.0 / max(self.n_components - 1, 1)
                     self.transmat_[i, i] = 0.0
