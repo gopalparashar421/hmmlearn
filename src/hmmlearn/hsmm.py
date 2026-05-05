@@ -20,20 +20,22 @@ import logging
 import string
 
 import numpy as np
-from scipy import special
+from scipy import linalg, special
 from scipy.stats import nbinom, poisson as sp_poisson
+from sklearn import cluster
 from sklearn.base import BaseEstimator
 from sklearn.utils.validation import check_array, check_is_fitted, check_random_state
 
-from . import _utils
+from . import _emissions, _utils
 from .base import ConvergenceMonitor
-from .utils import normalize, log_normalize
+from .utils import fill_covars, normalize, log_normalize
 
 
 __all__ = [
     "GaussianHSMM",
     "CategoricalHSMM",
     "PoissonHSMM",
+    "GaussianMixtureHSMM",
 ]
 
 _log = logging.getLogger(__name__)
@@ -385,10 +387,24 @@ class BaseHSMM(BaseEstimator):
         self.verbose = verbose
         self.params = params
         self.init_params = init_params
+        # HSMM only supports log-space computations; this satisfies the
+        # self.implementation reference required by _emissions mixins.
+        self.implementation = "log"
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _check_sum_1(self, name):
+        """Check that an array describes one or more distributions."""
+        s = getattr(self, name).sum(axis=-1)
+        if not np.allclose(s, 1):
+            raise ValueError(
+                f"{name} must sum to 1 (got {s:.4f})"
+                if s.ndim == 0
+                else f"{name} rows must sum to 1 (got row sums of {s})"
+                    if s.ndim == 1
+                    else "Expected 1D or 2D array")
 
     def _needs_init(self, code, name):
         if code in self.init_params:
@@ -443,6 +459,90 @@ class BaseHSMM(BaseEstimator):
             self.monitor_.report(curr_logprob)
             if self.monitor_.converged:
                 break
+        self.stats_accumulated_ = stats  # enables partial_fit after fit()
+        return self
+
+    def partial_fit(self, X, lengths=None, alpha=1.0):
+        """
+        Incrementally update model parameters with one E-step + M-step on X.
+
+        Follows the scikit-learn convention for online estimators.  Each call
+        runs one EM step on the provided batch, accumulating sufficient
+        statistics with a forgetting factor.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            Observation matrix.
+        lengths : array-like of int, optional
+            Lengths of individual sequences.  Defaults to one sequence.
+        alpha : float in (0, 1], default 1.0
+            Forgetting factor.  ``1.0`` accumulates all history (no
+            forgetting).  Values less than ``1.0`` weight recent data more
+            heavily, enabling adaptation to concept drift.
+
+            +----------+--------------------------------------------------+
+            | alpha    | behaviour                                        |
+            +==========+==================================================+
+            | 1.0      | pure accumulation — equivalent to one extra EM  |
+            |          | iteration over all data seen so far              |
+            +----------+--------------------------------------------------+
+            | < 1.0    | exponential forgetting — older statistics are   |
+            |          | down-weighted by ``alpha`` each call             |
+            +----------+--------------------------------------------------+
+
+        Returns
+        -------
+        self
+
+        Notes
+        -----
+        Sufficient-statistics key categorisation:
+
+        * **Forgettable** (scaled by *alpha* then merged):
+          ``start``, ``trans``, ``dur``, all emission keys.
+        * **Structural / reset-per-batch**: ``nobs`` — replaced, not decayed.
+
+        See Also
+        --------
+        fit : Full EM training over a fixed dataset.
+        """
+        # --- input validation ---
+        if not (isinstance(alpha, float) and 0.0 < alpha <= 1.0):
+            raise ValueError(
+                f"alpha must be a float in (0, 1]; got {alpha!r}")
+        X = check_array(X)
+        if lengths is None:
+            lengths = np.array([X.shape[0]])
+
+        # --- first-call detection ---
+        if not hasattr(self, "stats_accumulated_"):
+            # Only call _init if model has never been fitted.
+            if not hasattr(self, "startprob_"):
+                self._init(X, lengths)
+                self._check()
+            self.stats_accumulated_ = self._initialize_sufficient_statistics()
+            self.monitor_ = ConvergenceMonitor(self.tol, self.n_iter,
+                                               self.verbose)
+
+        # --- feature-dimension guard (every call) ---
+        self._check_and_set_n_features(X)
+
+        # --- E-step on batch ---
+        stats_batch, _ = self._do_estep(X, lengths)
+
+        # --- apply forgetting factor to accumulated stats ---
+        for key in self.stats_accumulated_:
+            if key == "nobs":
+                # structural: replace, not accumulate
+                self.stats_accumulated_["nobs"] = stats_batch["nobs"]
+            else:
+                self.stats_accumulated_[key] *= alpha
+                self.stats_accumulated_[key] += stats_batch[key]
+
+        # --- M-step ---
+        self._do_mstep(self.stats_accumulated_)
+
         return self
 
     def score(self, X, lengths=None):
@@ -922,9 +1022,7 @@ class BaseHSMM(BaseEstimator):
         self.startprob_ = np.asarray(self.startprob_)
         if len(self.startprob_) != self.n_components:
             raise ValueError("startprob_ must have length n_components")
-        s = self.startprob_.sum()
-        if not np.isclose(s, 1.0):
-            raise ValueError(f"startprob_ must sum to 1 (got {s})")
+        self._check_sum_1("startprob_")
 
         self.transmat_ = np.asarray(self.transmat_)
         if self.transmat_.shape != (self.n_components, self.n_components):
@@ -935,10 +1033,7 @@ class BaseHSMM(BaseEstimator):
                 "HSMM transmat_ must have zero diagonal (no self-transitions)")
         # A single-state HSMM has no valid transitions (1x1 zero matrix).
         if self.n_components > 1:
-            s = self.transmat_.sum(axis=1)
-            if not np.allclose(s, 1.0):
-                raise ValueError(
-                    f"transmat_ rows must sum to 1 (got {s})")
+            self._check_sum_1("transmat_")
 
         if not hasattr(self, "_duration_model_"):
             self._duration_model_ = self._build_duration_model()
@@ -953,6 +1048,16 @@ class BaseHSMM(BaseEstimator):
             'trans': np.zeros((N, N)),
             'dur': np.zeros((D, N)),
         }
+
+    def _accumulate_sufficient_statistics_log(
+            self, stats, X, lattice, posteriors, fwdlattice, bwdlattice):
+        """No-op: HSMM accumulates start/trans stats directly in _do_estep.
+
+        This method exists so that emission mixin super()-chains can call
+        _AbstractHMM._accumulate_sufficient_statistics() without error.
+        HSMM handles nobs/start/trans/dur statistics inside _do_estep().
+        """
+        pass
 
     # ------------------------------------------------------------------
     # Abstract methods – must be overridden in concrete subclasses
@@ -1007,7 +1112,7 @@ class BaseHSMM(BaseEstimator):
 # Concrete HSMM subclasses
 # ---------------------------------------------------------------------------
 
-class GaussianHSMM(BaseHSMM):
+class GaussianHSMM(_emissions.BaseGaussianHMM, BaseHSMM):
     """
     Hidden Semi-Markov Model with Gaussian emissions.
 
@@ -1057,6 +1162,20 @@ class GaussianHSMM(BaseHSMM):
     GaussianHSMM(...)
     """
 
+    # _AbstractHMM defines fit/score/sample/decode/etc. but BaseHSMM has
+    # HSMM-specific implementations. Explicitly bind BaseHSMM's versions so
+    # that _AbstractHMM's HMM-centric methods (earlier in the MRO) do not
+    # shadow them.
+    fit = BaseHSMM.fit
+    score = BaseHSMM.score
+    score_samples = BaseHSMM.score_samples
+    decode = BaseHSMM.decode
+    predict = BaseHSMM.predict
+    predict_proba = BaseHSMM.predict_proba
+    sample = BaseHSMM.sample
+    _do_estep = BaseHSMM._do_estep
+    _do_mstep = BaseHSMM._do_mstep
+
     def __init__(self, n_components=1,
                  covariance_type="diag",
                  duration_distribution="poisson",
@@ -1072,7 +1191,10 @@ class GaussianHSMM(BaseHSMM):
                  verbose=False,
                  params=string.ascii_letters,
                  init_params=string.ascii_letters):
-        super().__init__(
+        # Use BaseHSMM.__init__ directly to bypass _AbstractHMM.__init__
+        # which has an incompatible signature (no HSMM-specific parameters).
+        BaseHSMM.__init__(
+            self,
             n_components=n_components,
             duration_distribution=duration_distribution,
             max_duration=max_duration,
@@ -1095,7 +1217,11 @@ class GaussianHSMM(BaseHSMM):
 
     @property
     def covars_(self):
-        return self._covars_
+        """Return covars as a full matrix (required by BaseGaussianHMM mixin)."""
+        from .utils import fill_covars
+        return fill_covars(self._covars_, self.covariance_type,
+                           self.n_components,
+                           self.n_features if hasattr(self, "n_features") else 1)
 
     @covars_.setter
     def covars_(self, covars):
@@ -1150,8 +1276,16 @@ class GaussianHSMM(BaseHSMM):
             elif self.covariance_type == "tied":
                 self._covars_ = cv
 
+    def _needs_sufficient_statistics_for_mean(self):
+        return 'm' in self.params
+
+    def _needs_sufficient_statistics_for_covars(self):
+        return 'c' in self.params
+
     def _check(self):
-        super()._check()
+        # Call BaseHSMM._check explicitly: super()._check() would resolve to
+        # _AbstractHMM._check() which raises NotImplementedError.
+        BaseHSMM._check(self)
         from ._utils import _validate_covars
         if not hasattr(self, "n_features"):
             raise ValueError("n_features is not set")
@@ -1161,20 +1295,9 @@ class GaussianHSMM(BaseHSMM):
                 f"means_ must have shape (n_components, n_features)")
         _validate_covars(self._covars_, self.covariance_type, self.n_components)
 
-    # --- emission model ---
-
-    def _compute_log_likelihood(self, X):
-        from .stats import log_multivariate_normal_density
-        return log_multivariate_normal_density(
-            X, self.means_, self._covars_, self.covariance_type)
-
-    def _generate_sample_from_state(self, state, random_state):
-        from .utils import fill_covars
-        cov = fill_covars(self._covars_, self.covariance_type,
-                          self.n_components, self.n_features)
-        return random_state.multivariate_normal(self.means_[state], cov[state])
-
     # --- sufficient statistics ---
+    # _compute_log_likelihood and _generate_sample_from_state are inherited
+    # from _emissions.BaseGaussianHMM via the MRO.
 
     def _get_n_fit_scalars_per_param(self):
         N, F = self.n_components, self.n_features
@@ -1195,22 +1318,27 @@ class GaussianHSMM(BaseHSMM):
         }
 
     def _initialize_sufficient_statistics(self):
+        # Call the mixin chain (BaseGaussianHMM → _AbstractHMM) which adds
+        # post/obs/obs**2/obs*obs.T keys on top of nobs/start/trans.
+        # Then add the HSMM-specific 'dur' key.
         stats = super()._initialize_sufficient_statistics()
-        N, F = self.n_components, self.n_features
-        stats['obs'] = np.zeros((N, F))
-        stats['obs**2'] = np.zeros((N, F))
-        stats['obs*obs.T'] = np.zeros((N, F, F))
-        stats['post'] = np.zeros(N)
+        stats['dur'] = np.zeros((self.max_duration, self.n_components))
         return stats
 
     def _accumulate_emission_sufficient_statistics(self, stats, X, posteriors):
-        stats['post'] += posteriors.sum(axis=0)
-        stats['obs'] += posteriors.T @ X
-        if self.covariance_type in ('spherical', 'diag'):
-            stats['obs**2'] += posteriors.T @ (X ** 2)
-        if self.covariance_type in ('full', 'tied'):
-            for t, o in enumerate(X):
-                stats['obs*obs.T'] += posteriors[t, :, None, None] * np.outer(o, o)
+        # Replicate the emission-specific part of
+        # BaseGaussianHMM._accumulate_sufficient_statistics directly,
+        # bypassing the _AbstractHMM super()-chain (which requires a lattice
+        # argument not available in the HSMM E-step).
+        if self._needs_sufficient_statistics_for_mean():
+            stats['post'] += posteriors.sum(axis=0)
+            stats['obs'] += posteriors.T @ X
+        if self._needs_sufficient_statistics_for_covars():
+            if self.covariance_type in ('spherical', 'diag'):
+                stats['obs**2'] += posteriors.T @ (X ** 2)
+            elif self.covariance_type in ('tied', 'full'):
+                stats['obs*obs.T'] += np.einsum(
+                    'ij,ik,il->jkl', posteriors, X, X)
 
     def _do_emission_mstep(self, stats):
         N, F = self.n_components, self.n_features
@@ -1260,7 +1388,7 @@ class GaussianHSMM(BaseHSMM):
                 self._covars_ = cv
 
 
-class CategoricalHSMM(BaseHSMM):
+class CategoricalHSMM(_emissions.BaseCategoricalHMM, BaseHSMM):
     """
     Hidden Semi-Markov Model with categorical (discrete) emissions.
 
@@ -1299,6 +1427,21 @@ class CategoricalHSMM(BaseHSMM):
     >>> X, Z = model.sample(100)
     """
 
+    # _AbstractHMM defines fit/score/sample/decode/etc. but BaseHSMM has
+    # HSMM-specific implementations. Explicitly bind BaseHSMM's versions so
+    # that _AbstractHMM's HMM-centric methods (earlier in the MRO) do not
+    # shadow them.  Note: BaseCategoricalHMM.__init_subclass__ will wrap these
+    # in docstring-modifying closures; the underlying logic remains BaseHSMM's.
+    fit = BaseHSMM.fit
+    score = BaseHSMM.score
+    score_samples = BaseHSMM.score_samples
+    decode = BaseHSMM.decode
+    predict = BaseHSMM.predict
+    predict_proba = BaseHSMM.predict_proba
+    sample = BaseHSMM.sample
+    _do_estep = BaseHSMM._do_estep
+    _do_mstep = BaseHSMM._do_mstep
+
     def __init__(self, n_components=1,
                  n_features=None,
                  duration_distribution="poisson",
@@ -1312,7 +1455,10 @@ class CategoricalHSMM(BaseHSMM):
                  verbose=False,
                  params=string.ascii_letters,
                  init_params=string.ascii_letters):
-        super().__init__(
+        # Use BaseHSMM.__init__ directly to bypass _AbstractHMM.__init__
+        # which has an incompatible signature (no HSMM-specific parameters).
+        BaseHSMM.__init__(
+            self,
             n_components=n_components,
             duration_distribution=duration_distribution,
             max_duration=max_duration,
@@ -1347,24 +1493,17 @@ class CategoricalHSMM(BaseHSMM):
                 np.ones(self.n_features), size=self.n_components)
 
     def _check(self):
-        super()._check()
+        # Call BaseHSMM._check explicitly: super()._check() would resolve to
+        # _AbstractHMM._check() which raises NotImplementedError.
+        BaseHSMM._check(self)
         self.emissionprob_ = np.asarray(self.emissionprob_)
         if self.emissionprob_.shape != (self.n_components, self.n_features):
             raise ValueError(
                 f"emissionprob_ must have shape (n_components, n_features)")
-        s = self.emissionprob_.sum(axis=1)
-        if not np.allclose(s, 1.0):
-            raise ValueError("emissionprob_ rows must sum to 1")
+        self._check_sum_1("emissionprob_")
 
-    def _compute_log_likelihood(self, X):
-        # X shape: (T, 1) of integers
-        X_flat = X.squeeze(axis=1) if X.ndim == 2 else X
-        with np.errstate(divide="ignore"):
-            return np.log(self.emissionprob_[:, X_flat].T)  # (T, N)
-
-    def _generate_sample_from_state(self, state, random_state):
-        return np.array([random_state.choice(self.n_features,
-                                             p=self.emissionprob_[state])])
+    # _compute_log_likelihood and _generate_sample_from_state are inherited
+    # from _emissions.BaseCategoricalHMM via the MRO.
 
     def _get_n_fit_scalars_per_param(self):
         N, F = self.n_components, self.n_features
@@ -1378,14 +1517,20 @@ class CategoricalHSMM(BaseHSMM):
         }
 
     def _initialize_sufficient_statistics(self):
+        # Call the mixin chain (BaseCategoricalHMM → _AbstractHMM) which adds
+        # the 'obs' key on top of nobs/start/trans.
+        # Then add the HSMM-specific 'dur' key.
         stats = super()._initialize_sufficient_statistics()
-        stats['obs'] = np.zeros((self.n_components, self.n_features))
+        stats['dur'] = np.zeros((self.max_duration, self.n_components))
         return stats
 
     def _accumulate_emission_sufficient_statistics(self, stats, X, posteriors):
-        X_flat = X.squeeze(axis=1) if X.ndim == 2 else X
-        for t, obs in enumerate(X_flat):
-            stats['obs'][:, obs] += posteriors[t]
+        # Replicate the emission-specific part of
+        # BaseCategoricalHMM._accumulate_sufficient_statistics directly,
+        # bypassing the _AbstractHMM super()-chain (which requires a lattice
+        # argument not available in the HSMM E-step).
+        if 'e' in self.params:
+            np.add.at(stats['obs'].T, X.squeeze(1), posteriors)
 
     def _do_emission_mstep(self, stats):
         if 'e' in self.params:
@@ -1524,3 +1669,515 @@ class PoissonHSMM(BaseHSMM):
         if 'l' in self.params:
             denom = np.maximum(self.lambdas_weight + stats['post'], 1e-10)
             self.lambdas_ = (self.lambdas_prior + stats['obs']) / denom
+
+
+# ---------------------------------------------------------------------------
+# GaussianMixtureHSMM
+# ---------------------------------------------------------------------------
+
+class GaussianMixtureHSMM(_emissions.BaseGMMHMM, BaseHSMM):
+    """
+    Hidden Semi-Markov Model with Gaussian Mixture emissions (GMMHSMM).
+
+    Combines the Gaussian Mixture Model emission flexibility of
+    :class:`~hmmlearn.hmm.GMMHMM` with the explicit-duration framework of
+    :class:`BaseHSMM`.  Each hidden state emits observations drawn from a
+    per-state mixture of Gaussians, while durations are governed by the chosen
+    ``duration_distribution``.
+
+    Parameters
+    ----------
+    n_components : int
+        Number of hidden states.
+    n_mix : int
+        Number of Gaussian mixture components per state.
+    covariance_type : {"diag", "full", "spherical", "tied"}
+        Covariance structure for the mixture components.
+    duration_distribution : {"poisson", "gaussian", "negative_binomial",
+                             "uniform"}
+        Duration distribution family.
+    max_duration : int
+        Maximum segment length modelled explicitly.
+    min_covar : float
+        Floor added to covariance diagonal for numerical stability.
+    startprob_prior, transmat_prior : float
+        Dirichlet priors on start probabilities and transition rows.
+    weights_prior : float or array
+        Dirichlet prior on mixture weights.
+    means_prior, means_weight : float or array
+        Normal prior on mixture means.
+    covars_prior, covars_weight : float or array or None
+        Prior on mixture covariances; defaults set automatically based on
+        ``covariance_type``.
+    algorithm : {"viterbi", "map"}
+    random_state : int or RandomState, optional
+    n_iter : int
+    tol : float
+    verbose : bool
+    params : str
+        Characters selecting which parameters are updated in M-step.
+        ``'s'`` startprob, ``'t'`` transmat, ``'d'`` duration,
+        ``'m'`` means, ``'c'`` covars, ``'w'`` mixture weights.
+    init_params : str
+        Characters selecting which parameters are initialised before EM.
+
+    Attributes
+    ----------
+    weights_ : ndarray, shape (n_components, n_mix)
+    means_ : ndarray, shape (n_components, n_mix, n_features)
+    covars_ : ndarray
+        Shape depends on ``covariance_type``:
+        ``(n_components, n_mix)``                          if "spherical",
+        ``(n_components, n_mix, n_features)``              if "diag",
+        ``(n_components, n_mix, n_features, n_features)``  if "full",
+        ``(n_components, n_features, n_features)``         if "tied".
+    startprob_ : ndarray, shape (n_components,)
+    transmat_ : ndarray, shape (n_components, n_components)
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from hmmlearn.hsmm import GaussianMixtureHSMM
+    >>> rng = np.random.RandomState(42)
+    >>> model = GaussianMixtureHSMM(n_components=2, n_mix=2, n_iter=5)
+    >>> X, Z = model.sample(200)
+    >>> model.fit(X)  # doctest: +ELLIPSIS
+    GaussianMixtureHSMM(...)
+    """
+
+    # BaseGMMHMM → BaseHMM → _AbstractHMM defines fit/score/sample/decode etc.
+    # using HMM-specific forward-backward.  Explicitly bind BaseHSMM versions
+    # so the HSMM-correct implementations shadow the earlier-MRO HMM ones.
+    fit = BaseHSMM.fit
+    score = BaseHSMM.score
+    score_samples = BaseHSMM.score_samples
+    decode = BaseHSMM.decode
+    predict = BaseHSMM.predict
+    predict_proba = BaseHSMM.predict_proba
+    sample = BaseHSMM.sample
+    _do_estep = BaseHSMM._do_estep
+    _do_mstep = BaseHSMM._do_mstep
+
+    def __init__(self, n_components=1, n_mix=1,
+                 covariance_type="diag",
+                 duration_distribution="poisson",
+                 max_duration=_DEFAULT_MAX_DURATION,
+                 min_covar=1e-3,
+                 startprob_prior=1.0,
+                 transmat_prior=1.0,
+                 weights_prior=1.0,
+                 means_prior=0.0,
+                 means_weight=0.0,
+                 covars_prior=None,
+                 covars_weight=None,
+                 algorithm="viterbi",
+                 random_state=None,
+                 n_iter=10,
+                 tol=1e-2,
+                 verbose=False,
+                 params="stdmcw",
+                 init_params="stdmcw"):
+        # Call BaseHSMM.__init__ directly — BaseGMMHMM.__init__ chains into
+        # BaseHMM.__init__ which has an incompatible constructor signature.
+        BaseHSMM.__init__(
+            self,
+            n_components=n_components,
+            duration_distribution=duration_distribution,
+            max_duration=max_duration,
+            startprob_prior=startprob_prior,
+            transmat_prior=transmat_prior,
+            algorithm=algorithm,
+            random_state=random_state,
+            n_iter=n_iter,
+            tol=tol,
+            verbose=verbose,
+            params=params,
+            init_params=init_params,
+        )
+        self.n_mix = n_mix
+        self.covariance_type = covariance_type
+        self.min_covar = min_covar
+        self.weights_prior = weights_prior
+        self.means_prior = means_prior
+        self.means_weight = means_weight
+        self.covars_prior = covars_prior
+        self.covars_weight = covars_weight
+
+    # ------------------------------------------------------------------
+    # Covariance prior helpers (mirrored from GMMHMM)
+    # ------------------------------------------------------------------
+
+    def _init_covar_priors(self):
+        """Set default scalar values for covars_prior / covars_weight."""
+        if self.covariance_type == "full":
+            if self.covars_prior is None:
+                self.covars_prior = 0.0
+            if self.covars_weight is None:
+                self.covars_weight = -(1.0 + self.n_features + 1.0)
+        elif self.covariance_type == "tied":
+            if self.covars_prior is None:
+                self.covars_prior = 0.0
+            if self.covars_weight is None:
+                self.covars_weight = -(self.n_mix + self.n_features + 1.0)
+        elif self.covariance_type == "diag":
+            if self.covars_prior is None:
+                self.covars_prior = -1.5
+            if self.covars_weight is None:
+                self.covars_weight = 0.0
+        elif self.covariance_type == "spherical":
+            if self.covars_prior is None:
+                self.covars_prior = -(self.n_mix + 2.0) / 2.0
+            if self.covars_weight is None:
+                self.covars_weight = 0.0
+
+    def _fix_priors_shape(self):
+        """Broadcast scalar priors to the correct array shapes."""
+        nc = self.n_components
+        nf = self.n_features
+        nm = self.n_mix
+        self.weights_prior = np.broadcast_to(
+            self.weights_prior, (nc, nm)).copy()
+        self.means_prior = np.broadcast_to(
+            self.means_prior, (nc, nm, nf)).copy()
+        self.means_weight = np.broadcast_to(
+            self.means_weight, (nc, nm)).copy()
+        if self.covariance_type == "full":
+            self.covars_prior = np.broadcast_to(
+                self.covars_prior, (nc, nm, nf, nf)).copy()
+            self.covars_weight = np.broadcast_to(
+                self.covars_weight, (nc, nm)).copy()
+        elif self.covariance_type == "tied":
+            self.covars_prior = np.broadcast_to(
+                self.covars_prior, (nc, nf, nf)).copy()
+            self.covars_weight = np.broadcast_to(
+                self.covars_weight, nc).copy()
+        elif self.covariance_type == "diag":
+            self.covars_prior = np.broadcast_to(
+                self.covars_prior, (nc, nm, nf)).copy()
+            self.covars_weight = np.broadcast_to(
+                self.covars_weight, (nc, nm, nf)).copy()
+        elif self.covariance_type == "spherical":
+            self.covars_prior = np.broadcast_to(
+                self.covars_prior, (nc, nm)).copy()
+            self.covars_weight = np.broadcast_to(
+                self.covars_weight, (nc, nm)).copy()
+
+    # ------------------------------------------------------------------
+    # Feature-dimension bookkeeping
+    # ------------------------------------------------------------------
+
+    def _check_and_set_n_features(self, X):
+        _, n_features = X.shape
+        if hasattr(self, "n_features") and self.n_features is not None:
+            if self.n_features != n_features:
+                raise ValueError(
+                    f"Unexpected number of dimensions: got {n_features} "
+                    f"but expected {self.n_features}")
+        else:
+            self.n_features = n_features
+
+    # ------------------------------------------------------------------
+    # Initialisation
+    # ------------------------------------------------------------------
+
+    def _init(self, X, lengths=None):
+        # Initialise n_features, startprob_, transmat_, _duration_model_.
+        BaseHSMM._init(self, X, lengths)
+        nc = self.n_components
+        nf = self.n_features
+        nm = self.n_mix
+
+        def compute_cv():
+            if X.shape[0] > 1:
+                return np.cov(X.T) + self.min_covar * np.eye(nf)
+            return self.min_covar * np.eye(nf)
+
+        # Ensure prior scalars are set and broadcast to correct shapes.
+        self._init_covar_priors()
+        self._fix_priors_shape()
+
+        # ------ K-means seeding ------
+        # Cluster data into n_components groups; within each group find
+        # n_mix sub-clusters for mixture initialisation.
+        cv = None
+        if X.shape[0] >= nc:
+            main_kmeans = cluster.KMeans(
+                n_clusters=nc, random_state=self.random_state, n_init=10)
+            labels = main_kmeans.fit_predict(X)
+            main_centroid = np.mean(main_kmeans.cluster_centers_, axis=0)
+        else:
+            # Fewer samples than states: assign each sample to its own state.
+            labels = np.arange(X.shape[0]) % nc
+            main_centroid = X.mean(axis=0)
+
+        rng = check_random_state(self.random_state)
+        means = []
+        for label in range(nc):
+            X_cluster = X[labels == label]
+            if X_cluster.shape[0] >= nm:
+                sub_kmeans = cluster.KMeans(
+                    n_clusters=nm, random_state=self.random_state, n_init=10)
+                sub_kmeans.fit(X_cluster)
+                means.append(sub_kmeans.cluster_centers_)
+            else:
+                if cv is None:
+                    cv = compute_cv()
+                m_cluster = rng.multivariate_normal(
+                    main_centroid, cov=cv, size=nm)
+                means.append(m_cluster)
+
+        if self._needs_init("w", "weights_"):
+            self.weights_ = np.full((nc, nm), 1.0 / nm)
+
+        if self._needs_init("m", "means_"):
+            self.means_ = np.stack(means)
+
+        if self._needs_init("c", "covars_"):
+            if cv is None:
+                cv = compute_cv()
+            if not cv.shape:
+                cv.shape = (1, 1)
+            if self.covariance_type == "tied":
+                self.covars_ = np.tile(cv, (nc, 1, 1))
+            elif self.covariance_type == "full":
+                self.covars_ = np.tile(cv, (nc, nm, 1, 1))
+            elif self.covariance_type == "diag":
+                self.covars_ = np.tile(np.diag(cv), (nc, nm, 1))
+            elif self.covariance_type == "spherical":
+                self.covars_ = np.full((nc, nm), cv.mean())
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def _check(self):
+        # Call BaseHSMM._check explicitly: super()._check() would route to
+        # _AbstractHMM._check() (via BaseGMMHMM → BaseHMM) which raises
+        # NotImplementedError.
+        BaseHSMM._check(self)
+        if not hasattr(self, "n_features"):
+            self.n_features = self.means_.shape[2]
+        nc = self.n_components
+        nf = self.n_features
+        nm = self.n_mix
+
+        self._init_covar_priors()
+        self._fix_priors_shape()
+
+        _COVARIANCE_TYPES = ("spherical", "diag", "full", "tied")
+        if self.covariance_type not in _COVARIANCE_TYPES:
+            raise ValueError(
+                f"covariance_type must be one of {_COVARIANCE_TYPES}")
+
+        self.weights_ = np.array(self.weights_)
+        if self.weights_.shape != (nc, nm):
+            raise ValueError(
+                f"weights_ must have shape (n_components, n_mix), "
+                f"actual shape: {self.weights_.shape}")
+        self._check_sum_1("weights_")
+
+        self.means_ = np.array(self.means_)
+        if self.means_.shape != (nc, nm, nf):
+            raise ValueError(
+                f"means_ must have shape (n_components, n_mix, n_features), "
+                f"actual shape: {self.means_.shape}")
+
+        self.covars_ = np.array(self.covars_)
+        needed_shapes = {
+            "spherical": (nc, nm),
+            "tied": (nc, nf, nf),
+            "diag": (nc, nm, nf),
+            "full": (nc, nm, nf, nf),
+        }
+        needed_shape = needed_shapes[self.covariance_type]
+        if self.covars_.shape != needed_shape:
+            raise ValueError(
+                f"{self.covariance_type!r} covars_ must have shape "
+                f"{needed_shape}, actual shape: {self.covars_.shape}")
+
+        if self.covariance_type in ("spherical", "diag"):
+            if np.any(self.covars_ < 0):
+                raise ValueError(
+                    f"{self.covariance_type!r} covars_ must be non-negative")
+        elif self.covariance_type == "tied":
+            for i, covar in enumerate(self.covars_):
+                if not np.allclose(covar, covar.T):
+                    raise ValueError(
+                        f"Covariance of state #{i} is not symmetric")
+                if linalg.eigvalsh(covar).min() < 0:
+                    raise ValueError(
+                        f"Covariance of state #{i} is not positive definite")
+        elif self.covariance_type == "full":
+            for i, mix_covars in enumerate(self.covars_):
+                for j, covar in enumerate(mix_covars):
+                    if not np.allclose(covar, covar.T):
+                        raise ValueError(
+                            f"Covariance of state #{i}, mixture #{j} "
+                            f"is not symmetric")
+                    if linalg.eigvalsh(covar).min() < 0:
+                        raise ValueError(
+                            f"Covariance of state #{i}, mixture #{j} "
+                            f"is not positive definite")
+
+    # ------------------------------------------------------------------
+    # Sufficient statistics
+    # ------------------------------------------------------------------
+
+    def _initialize_sufficient_statistics(self):
+        # Must call BaseHSMM explicitly: super() would route to
+        # BaseGMMHMM → BaseHMM → _AbstractHMM, bypassing BaseHSMM and
+        # omitting the 'dur' key.
+        stats = BaseHSMM._initialize_sufficient_statistics(self)
+        # Add GMM emission statistics (mirrors BaseGMMHMM._initialize_...).
+        stats['post_mix_sum'] = np.zeros((self.n_components, self.n_mix))
+        stats['post_sum'] = np.zeros(self.n_components)
+        if 'm' in self.params:
+            lambdas, mus = self.means_weight, self.means_prior
+            stats['m_n'] = lambdas[:, :, None] * mus
+        if 'c' in self.params:
+            stats['c_n'] = np.zeros_like(self.covars_)
+        return stats
+
+    def _accumulate_emission_sufficient_statistics(self, stats, X, posteriors):
+        # Inline the GMM-specific accumulation from
+        # BaseGMMHMM._accumulate_sufficient_statistics, skipping the
+        # super()._accumulate_sufficient_statistics() call that would update
+        # nobs/start/trans (already handled by BaseHSMM._do_estep).
+        n_samples, _ = X.shape
+        post_comp = posteriors  # (n_samples, n_components)
+
+        # Compute per-sample mixture responsibilities for each state.
+        post_mix = np.zeros((n_samples, self.n_components, self.n_mix))
+        for p in range(self.n_components):
+            log_denses = self._compute_log_weighted_gaussian_densities(X, p)
+            log_normalize(log_denses, axis=-1)
+            with np.errstate(under="ignore"):
+                post_mix[:, p, :] = np.exp(log_denses)
+
+        with np.errstate(under="ignore"):
+            post_comp_mix = post_comp[:, :, None] * post_mix  # (T, nc, nm)
+
+        stats['post_mix_sum'] += post_comp_mix.sum(axis=0)
+        stats['post_sum'] += post_comp.sum(axis=0)
+
+        if 'm' in self.params:
+            stats['m_n'] += np.einsum('ijk,il->jkl', post_comp_mix, X)
+
+        if 'c' in self.params:
+            centered = X[:, None, None, :] - self.means_  # (T, nc, nm, nf)
+
+            def outer_f(x):
+                return x[..., :, None] * x[..., None, :]
+
+            if self.covariance_type == 'full':
+                centered_dots = outer_f(centered)
+                c_n = np.einsum('ijk,ijklm->jklm', post_comp_mix,
+                                centered_dots)
+            elif self.covariance_type == 'diag':
+                centered2 = np.square(centered)
+                c_n = np.einsum('ijk,ijkl->jkl', post_comp_mix, centered2)
+            elif self.covariance_type == 'spherical':
+                centered_norm2 = np.einsum('...i,...i', centered, centered)
+                c_n = np.einsum('ijk,ijk->jk', post_comp_mix, centered_norm2)
+            elif self.covariance_type == 'tied':
+                centered_dots = outer_f(centered)
+                c_n = np.einsum('ijk,ijklm->jlm', post_comp_mix, centered_dots)
+
+            stats['c_n'] += c_n
+
+    # ------------------------------------------------------------------
+    # M-step
+    # ------------------------------------------------------------------
+
+    def _do_emission_mstep(self, stats):
+        # Update mixture weights, means, and covariances.
+        # Mirrors GMMHMM._do_mstep (excluding the super()._do_mstep() call
+        # that updates start/transmat — BaseHSMM._do_mstep handles those).
+        nf = self.n_features
+        nm = self.n_mix
+
+        if 'w' in self.params:
+            alphas_minus_one = self.weights_prior - 1
+            w_n = stats['post_mix_sum'] + alphas_minus_one
+            w_d = (stats['post_sum'] + alphas_minus_one.sum(axis=1))[:, None]
+            self.weights_ = w_n / w_d
+
+        if 'm' in self.params:
+            m_n = stats['m_n']
+            m_d = stats['post_mix_sum'] + self.means_weight
+            # Zero-weight components: avoid nan by setting denominator to 1.
+            m_d[(self.weights_ == 0) & (m_n == 0).all(axis=-1)] = 1
+            self.means_ = m_n / m_d[:, :, None]
+
+        if 'c' in self.params:
+            lambdas, mus = self.means_weight, self.means_prior
+            centered_means = self.means_ - mus
+
+            def outer_f(x):
+                return x[..., :, None] * x[..., None, :]
+
+            if self.covariance_type == 'full':
+                centered_means_dots = outer_f(centered_means)
+                psis_t = np.transpose(self.covars_prior, axes=(0, 1, 3, 2))
+                nus = self.covars_weight
+                c_n = (psis_t
+                       + lambdas[:, :, None, None] * centered_means_dots
+                       + stats['c_n'])
+                c_d = (
+                    stats['post_mix_sum'] + 1 + nus + nf + 1
+                )[:, :, None, None]
+
+            elif self.covariance_type == 'diag':
+                alphas = self.covars_prior
+                betas = self.covars_weight
+                centered_means2 = centered_means ** 2
+                c_n = (lambdas[:, :, None] * centered_means2
+                       + 2 * betas
+                       + stats['c_n'])
+                c_d = stats['post_mix_sum'][:, :, None] + 1 + 2 * (alphas + 1)
+
+            elif self.covariance_type == 'spherical':
+                centered_means_norm2 = np.einsum(
+                    '...i,...i', centered_means, centered_means)
+                alphas = self.covars_prior
+                betas = self.covars_weight
+                c_n = (lambdas * centered_means_norm2
+                       + 2 * betas
+                       + stats['c_n'])
+                c_d = nf * (stats['post_mix_sum'] + 1) + 2 * (alphas + 1)
+
+            elif self.covariance_type == 'tied':
+                centered_means_dots = outer_f(centered_means)
+                psis_t = np.transpose(self.covars_prior, axes=(0, 2, 1))
+                nus = self.covars_weight
+                c_n = (np.einsum('ij,ijkl->ikl', lambdas, centered_means_dots)
+                       + psis_t
+                       + stats['c_n'])
+                c_d = (
+                    stats['post_sum'] + nm + nus + nf + 1
+                )[:, None, None]
+
+            self.covars_ = c_n / c_d
+
+    # ------------------------------------------------------------------
+    # Miscellaneous
+    # ------------------------------------------------------------------
+
+    def _get_n_fit_scalars_per_param(self):
+        N, F, M = self.n_components, self.n_features, self.n_mix
+        d = (self._duration_model_.n_fit_scalars()
+             if hasattr(self, "_duration_model_") else N)
+        nc = {
+            "full": N * M * F * (F + 1) // 2,
+            "diag": N * M * F,
+            "tied": N * F * (F + 1) // 2,
+            "spherical": N * M,
+        }[self.covariance_type]
+        return {
+            "s": N - 1,
+            "t": N * (N - 1),
+            "d": d,
+            "m": N * M * F,
+            "c": nc,
+            "w": M - 1,
+        }

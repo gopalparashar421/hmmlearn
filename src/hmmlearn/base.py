@@ -870,6 +870,20 @@ class BaseHMM(_AbstractHMM):
         eigvec = np.real_if_close(eigvecs[:, np.argmax(eigvals)])
         return eigvec / eigvec.sum()
 
+    def partial_fit(self, X, lengths=None, alpha=1.0):
+        """
+        Not yet implemented for HMM models. Available for HSMM models.
+
+        Raises
+        ------
+        NotImplementedError
+        """
+        raise NotImplementedError(
+            "partial_fit is not yet implemented for HMM models. "
+            "It is available for HSMM models (GaussianHSMM, CategoricalHSMM, "
+            "PoissonHSMM, GaussianMixtureHSMM). Contributions welcome."
+        )
+
     def _fit_scaling(self, X):
         frameprob = self._compute_likelihood(X)
         log_prob, fwdlattice, scaling_factors = _hmmc.forward_scaling(
