@@ -13,7 +13,7 @@ Target Release: v0.4.0
 | **ID** | 003 |
 | **Target Release** | v0.4.0 |
 | **Epic Alignment** | Feature expansion — streaming and incremental learning |
-| **Status** | Active |
+| **Status** | Active (v2 — Critic revision) |
 | **Created** | 2026-05-05 |
 
 ## Changelog
@@ -21,6 +21,7 @@ Target Release: v0.4.0
 | Date | Author | Change |
 |------|--------|--------|
 | 2026-05-05 | Planner | Initial draft |
+| 2026-05-05 | Planner | v2: Address Critic findings H-01, H-02, M-01, M-02, M-03, L-02 |
 
 ---
 
@@ -74,7 +75,9 @@ This makes it impossible to:
 3. The forgetting factor applies to **accumulated sufficient statistics**: `stats_total = alpha * stats_old + stats_new`.
 4. One EM step per `partial_fit` call is the correct granularity. Multi-iteration partial fits are out of scope.
 5. `partial_fit` does not update `monitor_` in the same way as `fit` — convergence checking across calls is the caller's responsibility.
-6. `check_is_fitted` from sklearn handles the "first call" detection.
+6. **[REVISED — H-01]** First-call detection uses `hasattr(self, 'stats_accumulated_')`, NOT `check_is_fitted`. Using `check_is_fitted` would raise `NotFittedError` on the first (legitimate) call. The guard is: `if not hasattr(self, 'stats_accumulated_')` → initialize.
+7. **[REVISED — M-03]** `stats['nobs']` is **structural** — it is NOT multiplied by alpha. It counts the total observations seen (or the batch count for normalization) and must be reset/replaced each batch, not decayed.
+8. **[NEW — L-02]** If `fit()` has been called before `partial_fit()`, `_init()` must NOT be called again (parameters are already fitted). The guard `hasattr(self, 'stats_accumulated_')` alone is insufficient. The first `partial_fit` call after a `fit()` call must preserve model parameters. Detection: initialize `stats_accumulated_` at the end of `fit()` (set it to the final stats dict), so `hasattr` returns True on the next `partial_fit` call.
 
 ---
 
@@ -86,16 +89,19 @@ This makes it impossible to:
 
 **Tasks**:
 1. Identify all sufficient statistics structures in `BaseHSMM._initialize_sufficient_statistics()` (nobs, start, trans, dur, plus emission-specific).
-2. Define which statistics are accumulated (sum over sequences) vs. overwritten (e.g., nobs).
+2. Define which statistics are accumulated vs. structural:
+   - **Forgettable** (multiplied by alpha): `stats['start']`, `stats['trans']`, `stats['dur']`, all emission stats (e.g., `stats['obs']`, `stats['post']`)
+   - **Structural / reset-per-batch**: `stats['nobs']` — represents batch size for normalization, replaced not decayed
 3. Specify the forgetting factor update rule:
-   - Before new batch: `stats_accumulated[key] *= alpha` for all relevant keys
-   - After E-step on batch: `stats_accumulated[key] += stats_batch[key]`
-4. Decide where to store `stats_accumulated_` — as a model attribute (persisted between calls).
-5. Define first-call behaviour: if `stats_accumulated_` does not exist, initialize fresh and call `_init()`.
+   - Before new batch: `stats_accumulated_[key] *= alpha` for all forgettable keys
+   - After E-step on batch: `stats_accumulated_[key] += stats_batch[key]`
+   - For structural keys: `stats_accumulated_['nobs'] = stats_batch['nobs']` (replace, don't accumulate)
+4. Store `stats_accumulated_` as a model attribute persisted between calls.
+5. **[L-02 fix]** At the end of `BaseHSMM.fit()`, set `self.stats_accumulated_ = stats` (the final E-step stats). This ensures that `hasattr(self, 'stats_accumulated_')` correctly prevents re-initialization when `partial_fit` is called after `fit()`.
 
 **Acceptance Criteria**:
-- Written spec (can be inline docstring in `partial_fit`)
-- All stat fields clearly categorized as forgettable vs. structural
+- Written spec in `partial_fit` docstring
+- All stat fields clearly categorized in a comment or docstring table
 
 ---
 
@@ -114,25 +120,30 @@ partial_fit(self, X, lengths=None, alpha=1.0)
 - `alpha`: forgetting factor, float in (0, 1]. `1.0` = no forgetting (accumulate forever).
 
 #### 2b — First-Call Initialization
-1. Detect first call: check for absence of `stats_accumulated_` attribute (or `is_fitted` check).
-2. On first call: call `_check()`, call `_init(X, lengths)`, call `_check()` again post-init.
-3. Initialize `self.stats_accumulated_` with `_initialize_sufficient_statistics()`.
+1. **[H-01 fix]** Detect first call with `if not hasattr(self, 'stats_accumulated_')` — do NOT use `check_is_fitted`.
+2. On first call (unfitted model): call `_check()`, call `_init(X, lengths)`, call `_check()` again post-init, instantiate `self.monitor_` (see Task 2g below).
+3. **[L-02]** If `fit()` was previously called, `stats_accumulated_` already exists (set at end of `fit()`). Skip `_init()`. Preserve fitted parameters.
+
+#### 2c — Feature Dimension Validation
+1. **[H-02 fix]** On EVERY call (not just first), call `_check_and_set_n_features(X)`. This guards against silent wrong results from mismatched feature dimensions on subsequent calls.
 
 #### 2c — E-Step on Batch
 1. Run one pass of `_do_estep(X, lengths)` on the provided batch → produces `stats_batch`.
 2. No loop, no convergence check — just one E-step.
 
 #### 2d — Forgetting Factor Application
-1. For each stat key in `stats_accumulated_`: `stats_accumulated_[key] *= alpha`
-2. Merge batch stats: `stats_accumulated_[key] += stats_batch[key]`
-3. Use the same merge logic as M-step expects.
+1. For each **forgettable** key in `stats_accumulated_`: `stats_accumulated_[key] *= alpha`
+2. Replace structural key: `stats_accumulated_['nobs'] = stats_batch['nobs']`
+3. Merge batch stats: `stats_accumulated_[key] += stats_batch[key]` for forgettable keys
 
 #### 2e — M-Step
 1. Call `_do_mstep(self.stats_accumulated_)`.
-2. This updates all model parameters in-place.
 
 #### 2f — Return Value
-1. Return `self` (sklearn convention for `partial_fit`).
+1. Return `self`.
+
+#### 2g — Monitor Initialization
+1. **[M-02 fix]** On first call, initialize `self.monitor_` as a `ConvergenceMonitor(self.tol, self.n_iter, self.verbose)`. This prevents `AttributeError` for users who inspect `model.monitor_` after `partial_fit`-only workflows.
 
 #### 2g — Input Validation
 1. Validate `X` with `check_array`.
@@ -166,12 +177,15 @@ partial_fit(self, X, lengths=None, alpha=1.0)
 **Objective**: Verify correctness of `partial_fit` for all HSMM classes.
 
 **Tasks**:
-1. Add `test_partial_fit` section to `test_hsmm.py` (or create `test_hsmm_online.py`):
-   - Single call: `partial_fit` on full dataset ≈ `fit(n_iter=1)` result
-   - Sequential calls: fitting one sequence at a time eventually converges
-   - Forgetting factor: `alpha=0.5` causes old statistics to decay (test that parameters drift toward new data distribution)
-   - First-call initialization: calling on unfitted model initializes parameters
+1. Add `partial_fit` section to `test_hsmm.py` (or create `test_hsmm_online.py`):
+   - Single call with pre-initialized model: verify parameters change after one batch
+   - Sequential calls: fitting one sequence at a time eventually produces stable parameters
+   - **[M-01 fix]** Equivalence test: use a **pre-initialized model** (manually set parameters) for both `partial_fit(all_data)` and one-iteration baseline. Do NOT compare against `fit(n_iter=1)` with separate initialization — different PRNG state makes this non-reproducible.
+   - Forgetting factor: `alpha=0.5` causes parameters to drift toward new data distribution (test with two clearly separated Gaussians switching mid-stream)
+   - First-call unfitted: `partial_fit` on a fresh model initializes parameters
+   - Post-fit: `partial_fit` after `fit()` preserves parameters and updates from batch
    - Return value: `partial_fit` returns `self`
+   - `monitor_` accessible after `partial_fit`-only workflow
 2. Test all three HSMM emission types.
 3. Verify `BaseHMM.partial_fit` stub raises correct error.
 
@@ -223,10 +237,13 @@ partial_fit(self, X, lengths=None, alpha=1.0)
 
 | Risk | Likelihood | Mitigation |
 |------|-----------|------------|
-| Single E-step per call may not converge for complex models | Medium | Document this is intentional; users control convergence via call frequency |
-| Forgetting factor makes statistics non-integer (Dirichlet priors expect integers) | Low | Statistics are expected values (floats throughout), so this is fine |
-| HSMM E-step is expensive; `partial_fit` won't hide that | Low | Document expected cost; no optimization required in this plan |
-| `stats_accumulated_` grows stale on refitting | Low | If `fit()` is called, `stats_accumulated_` should be reset; add reset logic in `_init()` |
+| `check_is_fitted` raises `NotFittedError` on first call | **Confirmed** | Use `hasattr(self, 'stats_accumulated_')` guard (Milestone 2b) |
+| Silent wrong results from mismatched feature dimension on re-call | **Confirmed** | Call `_check_and_set_n_features(X)` on every call (Milestone 2c) |
+| `monitor_` missing in `partial_fit`-only workflow | **Confirmed** | Initialize `monitor_` on first call (Milestone 2g) |
+| `stats['nobs']` incorrectly decayed by alpha | **Confirmed** | Treat `nobs` as structural — replace, don't decay (Milestone 1 Task 3) |
+| `fit()` then `partial_fit()` reinitializes parameters | **Confirmed** | Set `stats_accumulated_` at end of `fit()`; check `hasattr` guards correctly (Milestone 1 Task 5) |
+| Single E-step per call may not converge for complex models | Medium | Document intentional; users control convergence via call frequency |
+| HSMM E-step is expensive | Low | Document expected cost; no optimization in this plan |
 
 ---
 
