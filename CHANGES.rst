@@ -3,6 +3,26 @@ hmmlearn Changelog
 
 Here you can see the full list of changes between each hmmlearn release.
 
+Version 0.4.0
+~~~~~~~~~~~~~
+
+Unreleased.
+
+- Added ``GaussianMixtureHSMM`` to ``hmmlearn.hsmm``: a Hidden Semi-Markov
+  Model with Gaussian Mixture emissions combining per-state GMM emission
+  flexibility with explicit-duration modelling.  Supports all four
+  ``covariance_type`` values (``diag``, ``full``, ``spherical``, ``tied``)
+  and all four ``duration_distribution`` families.  (Plan 002)
+
+- Refactored ``GaussianHSMM`` and ``CategoricalHSMM`` to use the emission-mixin
+  composition pattern (``_emissions.BaseGaussianHMM`` and
+  ``_emissions.BaseCategoricalHMM``) consistent with ``hmm.py`` and ``vhmm.py``.
+  Emission logic (``_compute_log_likelihood``, ``_generate_sample_from_state``)
+  is now inherited from the mixins rather than duplicated inline.  Added
+  ``self.implementation = "log"`` to ``BaseHSMM`` and copied ``_check_sum_1``
+  from ``BaseHMM`` to satisfy mixin interface requirements.  Public API and all
+  exported names are unchanged.  (Plan 001)
+
 Version 0.3.3
 ~~~~~~~~~~~~~
 

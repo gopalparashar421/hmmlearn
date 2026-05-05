@@ -88,3 +88,30 @@ VariationalGaussianHMM
 
 .. autoclass:: hmmlearn.vhmm.VariationalGaussianHMM
    :exclude-members: set_params, get_params
+
+hmmlearn.hsmm
+-------------
+
+GaussianHSMM
+~~~~~~~~~~~~
+
+.. autoclass:: hmmlearn.hsmm.GaussianHSMM
+   :exclude-members: set_params, get_params
+
+CategoricalHSMM
+~~~~~~~~~~~~~~~
+
+.. autoclass:: hmmlearn.hsmm.CategoricalHSMM
+   :exclude-members: set_params, get_params
+
+PoissonHSMM
+~~~~~~~~~~~
+
+.. autoclass:: hmmlearn.hsmm.PoissonHSMM
+   :exclude-members: set_params, get_params
+
+GaussianMixtureHSMM
+~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: hmmlearn.hsmm.GaussianMixtureHSMM
+   :exclude-members: set_params, get_params
