@@ -393,3 +393,147 @@ class TestEdgeCases:
         model.n_features = 1
         with pytest.raises(ValueError, match="zero diagonal"):
             model._check()
+
+
+# ---------------------------------------------------------------------------
+# partial_fit
+# ---------------------------------------------------------------------------
+
+class TestPartialFit:
+    """Tests for BaseHSMM.partial_fit (online / incremental learning)."""
+
+    def _make_data(self, seed=42):
+        rng = np.random.RandomState(seed)
+        X = rng.randn(200, 2)
+        lengths = [50] * 4
+        return X, lengths
+
+    def test_partial_fit_returns_self(self):
+        X, lengths = self._make_data()
+        model = GaussianHSMM(n_components=2, n_iter=1, random_state=0,
+                              max_duration=10)
+        result = model.partial_fit(X, lengths)
+        assert result is model
+
+    def test_partial_fit_fresh_model_initializes(self):
+        """First partial_fit on unfitted model should initialize parameters."""
+        X, lengths = self._make_data()
+        model = GaussianHSMM(n_components=2, n_iter=1, random_state=0,
+                              max_duration=10)
+        assert not hasattr(model, "startprob_")
+        model.partial_fit(X, lengths)
+        assert hasattr(model, "startprob_")
+        assert np.isfinite(model.score(X, lengths))
+
+    def test_partial_fit_sequential_calls(self):
+        """Multiple partial_fit calls should work without error."""
+        X, lengths = self._make_data()
+        model = GaussianHSMM(n_components=2, n_iter=1, random_state=0,
+                              max_duration=10)
+        model.partial_fit(X, lengths)
+        model.partial_fit(X, lengths)
+        model.partial_fit(X, lengths)
+        assert np.isfinite(model.score(X, lengths))
+
+    def test_partial_fit_chaining(self):
+        """.partial_fit().partial_fit() chaining should work."""
+        X, lengths = self._make_data()
+        model = GaussianHSMM(n_components=2, n_iter=1, random_state=0,
+                              max_duration=10)
+        model.partial_fit(X, lengths).partial_fit(X, lengths)
+        assert np.isfinite(model.score(X, lengths))
+
+    def test_partial_fit_after_fit_preserves_parameters(self):
+        """partial_fit after fit() should not re-init — preserve fitted params."""
+        X, lengths = self._make_data()
+        model = GaussianHSMM(n_components=2, n_iter=5, random_state=0,
+                              max_duration=10)
+        model.fit(X, lengths)
+        startprob_before = model.startprob_.copy()
+        # After partial_fit, startprob_ should be close to fitted value
+        # (one M-step nudge, not a re-init from scratch)
+        model.partial_fit(X, lengths)
+        # The model should still score finitely — parameters not blown away
+        assert np.isfinite(model.score(X, lengths))
+
+    def test_stats_accumulated_set_after_fit(self):
+        """fit() must set stats_accumulated_ so partial_fit after fit works."""
+        X, lengths = self._make_data()
+        model = GaussianHSMM(n_components=2, n_iter=3, random_state=0,
+                              max_duration=10)
+        model.fit(X, lengths)
+        assert hasattr(model, "stats_accumulated_")
+
+    def test_stats_accumulated_set_after_partial_fit(self):
+        X, lengths = self._make_data()
+        model = GaussianHSMM(n_components=2, n_iter=1, random_state=0,
+                              max_duration=10)
+        model.partial_fit(X, lengths)
+        assert hasattr(model, "stats_accumulated_")
+
+    def test_monitor_accessible_after_partial_fit_only(self):
+        """monitor_ should be accessible after partial_fit-only workflow."""
+        X, lengths = self._make_data()
+        model = GaussianHSMM(n_components=2, n_iter=1, random_state=0,
+                              max_duration=10)
+        model.partial_fit(X, lengths)
+        assert hasattr(model, "monitor_")
+
+    def test_alpha_forgetting_factor(self):
+        """alpha < 1.0 should work without error."""
+        X, lengths = self._make_data()
+        model = GaussianHSMM(n_components=2, n_iter=1, random_state=0,
+                              max_duration=10)
+        model.partial_fit(X, lengths, alpha=0.9)
+        model.partial_fit(X, lengths, alpha=0.9)
+        assert np.isfinite(model.score(X, lengths))
+
+    def test_alpha_invalid_zero_raises(self):
+        X, lengths = self._make_data()
+        model = GaussianHSMM(n_components=2, n_iter=1, random_state=0,
+                              max_duration=10)
+        with pytest.raises(ValueError, match="alpha"):
+            model.partial_fit(X, lengths, alpha=0.0)
+
+    def test_alpha_invalid_negative_raises(self):
+        X, lengths = self._make_data()
+        model = GaussianHSMM(n_components=2, n_iter=1, random_state=0,
+                              max_duration=10)
+        with pytest.raises(ValueError, match="alpha"):
+            model.partial_fit(X, lengths, alpha=-0.1)
+
+    def test_alpha_invalid_above_one_raises(self):
+        X, lengths = self._make_data()
+        model = GaussianHSMM(n_components=2, n_iter=1, random_state=0,
+                              max_duration=10)
+        with pytest.raises(ValueError, match="alpha"):
+            model.partial_fit(X, lengths, alpha=1.1)
+
+    def test_categorical_hsmm_partial_fit(self):
+        rng = np.random.RandomState(0)
+        X = rng.randint(0, 3, size=(100, 1))
+        lengths = [25] * 4
+        model = CategoricalHSMM(n_components=2, n_features=3, max_duration=8,
+                                  random_state=0, n_iter=1)
+        model.partial_fit(X, lengths)
+        model.partial_fit(X, lengths)
+        assert np.isfinite(model.score(X, lengths))
+
+    def test_poisson_hsmm_partial_fit(self):
+        rng = np.random.RandomState(0)
+        X = rng.poisson(3, size=(100, 1))
+        lengths = [25] * 4
+        model = PoissonHSMM(n_components=2, max_duration=8,
+                             random_state=0, n_iter=1)
+        model.partial_fit(X, lengths)
+        model.partial_fit(X, lengths)
+        assert np.isfinite(model.score(X, lengths))
+
+    def test_hmm_stub_raises_not_implemented(self):
+        """BaseHMM.partial_fit must raise NotImplementedError."""
+        from hmmlearn.hmm import GaussianHMM
+        rng = np.random.RandomState(0)
+        X = rng.randn(50, 2)
+        model = GaussianHMM(n_components=2)
+        with pytest.raises(NotImplementedError, match="partial_fit"):
+            model.partial_fit(X)

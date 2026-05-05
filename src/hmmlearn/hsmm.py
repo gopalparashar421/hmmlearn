@@ -1218,7 +1218,6 @@ class GaussianHSMM(_emissions.BaseGaussianHMM, BaseHSMM):
     @property
     def covars_(self):
         """Return covars as a full matrix (required by BaseGaussianHMM mixin)."""
-        from .utils import fill_covars
         return fill_covars(self._covars_, self.covariance_type,
                            self.n_components,
                            self.n_features if hasattr(self, "n_features") else 1)
@@ -1292,7 +1291,7 @@ class GaussianHSMM(_emissions.BaseGaussianHMM, BaseHSMM):
         self.means_ = np.asarray(self.means_)
         if self.means_.shape != (self.n_components, self.n_features):
             raise ValueError(
-                f"means_ must have shape (n_components, n_features)")
+                "means_ must have shape (n_components, n_features)")
         _validate_covars(self._covars_, self.covariance_type, self.n_components)
 
     # --- sufficient statistics ---
@@ -1499,7 +1498,7 @@ class CategoricalHSMM(_emissions.BaseCategoricalHMM, BaseHSMM):
         self.emissionprob_ = np.asarray(self.emissionprob_)
         if self.emissionprob_.shape != (self.n_components, self.n_features):
             raise ValueError(
-                f"emissionprob_ must have shape (n_components, n_features)")
+                "emissionprob_ must have shape (n_components, n_features)")
         self._check_sum_1("emissionprob_")
 
     # _compute_log_likelihood and _generate_sample_from_state are inherited
