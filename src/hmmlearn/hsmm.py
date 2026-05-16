@@ -1754,6 +1754,7 @@ class GaussianMixtureHSMM(_emissions.BaseGMMHMM, BaseHSMM):
     predict = BaseHSMM.predict
     predict_proba = BaseHSMM.predict_proba
     sample = BaseHSMM.sample
+    partial_fit = BaseHSMM.partial_fit
     _do_estep = BaseHSMM._do_estep
     _do_mstep = BaseHSMM._do_mstep
 
